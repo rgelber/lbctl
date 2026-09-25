@@ -1,0 +1,11 @@
+# Build artifacts
+lbctl-*.tar.gz
+dist/
+_stage/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local rpmbuild tree
+rpmbuild/

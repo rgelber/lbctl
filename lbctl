@@ -1,0 +1,1052 @@
+#!/usr/bin/env python3
+"""Gracefully disable an F5 BIG-IP pool member for maintenance.
+
+Flow for `disable`:
+  1. Set the member's session to "user-disabled" (it leaves load-balancing
+     rotation; the health monitor no longer governs it, so no monitor
+     "failure" is generated while the node comes out).
+  2. Wait for active connections to drain to zero (configurable timeout).
+
+`enable` flips the session state back ("user-enabled") to bring a node back
+into service. `disable` also covers a quick drain (with --max-wait 0), where
+you just want to pull a node out of rotation without waiting. `status`
+reports current state for one member (--member) or, if --member is omitted,
+every member in the pool.
+
+`list-partitions`, `list-pools`, and `list-members` are read-only discovery
+commands: they list the administrative partitions, pools, and pool members
+visible with the configured credentials, so you can find the exact
+`--partition`/`--pool`/`--member` values to target before running
+`status`/`disable`/`enable`.
+
+`--member`/`-m` accepts either the member's IP address or its BIG-IP node
+name -- pool members are often created against a named node rather than a
+raw IP, so this lets you target one the same way you'd refer to it in the
+F5 UI, without having to look up its IP or port first. A port is only
+needed (as `name:port`) if a pool happens to have the same node/IP on more
+than one port.
+"""
+import argparse
+import base64
+import getpass
+import json
+import os
+import re
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+try:
+    import tomllib  # stdlib, Python 3.11+
+except ImportError:
+    tomllib = None
+
+__version__ = "0.1.0"
+
+DEFAULT_POLL_INTERVAL = 5
+DEFAULT_MAX_WAIT = 300
+
+
+class F5Error(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Pretty output helpers. Colors/emoji are disabled automatically when the
+# relevant stream is not a TTY (e.g. piped/redirected) or when NO_COLOR is
+# set, so scripted use and log capture stay clean. Set LBCTL_COLOR=always
+# to force them on (e.g. when piping through a pager that preserves ANSI
+# codes).
+# ---------------------------------------------------------------------------
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    B_RED = "\033[91m"
+    B_GREEN = "\033[92m"
+    B_YELLOW = "\033[93m"
+    B_BLUE = "\033[94m"
+    B_MAGENTA = "\033[95m"
+    B_CYAN = "\033[96m"
+
+
+def _use_color():
+    # NO_COLOR (https://no-color.org) is an explicit opt-out and always
+    # wins, even over LBCTL_COLOR=always.
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("LBCTL_COLOR") == "always":
+        return True
+    return sys.stdout.isatty()
+
+
+def _use_color_err():
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("LBCTL_COLOR") == "always":
+        return True
+    return sys.stderr.isatty()
+
+
+USE_COLOR = _use_color()
+USE_COLOR_ERR = _use_color_err()
+
+
+def c(code, text):
+    return f"{code}{text}{C.RESET}" if USE_COLOR else text
+
+
+def ce(code, text):
+    """Like c(), but for stderr-bound text (uses USE_COLOR_ERR)."""
+    return f"{code}{text}{C.RESET}" if USE_COLOR_ERR else text
+
+
+def emo(icon, enabled=None):
+    """A trailing-spaced emoji/icon, or '' when decoration is disabled --
+    keeps piped/scripted output free of stray glyphs."""
+    if enabled is None:
+        enabled = USE_COLOR
+    return f"{icon} " if enabled else ""
+
+
+def err(text):
+    """Print an error message to stderr: bold red, with a fitting icon."""
+    msg = f"{emo('\u274c', USE_COLOR_ERR)}error: {text}"
+    print(ce(C.BOLD + C.RED, msg), file=sys.stderr)
+
+
+def header(text, icon="\U0001f527"):
+    """Section banner for the thing being acted on (e.g. 'disable: ...')."""
+    print(c(C.BOLD + C.B_CYAN, f"\n{emo(icon)}== {text} =="))
+
+
+def ok(text):
+    print(c(C.BOLD + C.B_GREEN, f"  {emo(chr(0x2705))}{text}"))
+
+
+def warn(text):
+    print(c(C.BOLD + C.B_YELLOW, f"  {emo(chr(0x26a0) + chr(0xfe0f))}{text}"))
+
+
+def info(text, icon=""):
+    print(f"  {emo(icon) if icon else ''}{c(C.B_BLUE, text) if icon else text}")
+
+
+def dim(text):
+    print(c(C.DIM, f"  {text}"))
+
+
+def fun(text, icon="\U0001f389"):
+    """A little celebratory flourish for happy-path completions."""
+    print(c(C.BOLD + C.B_MAGENTA, f"  {emo(icon)}{text}"))
+
+
+STATUS_GOOD = ("enabled", "up", "available")
+STATUS_BAD = ("disabled", "down", "offline", "unavailable")
+
+
+def status_badge(value):
+    """Colored dot + colored text for a status-ish value.
+
+    Matches by substring (not exact equality) because real BIG-IP session
+    values are compound, e.g. "monitor-enabled", "user-enabled",
+    "user-disabled" -- not the bare "enabled"/"disabled" this originally
+    assumed.
+    """
+    v = str(value).lower()
+    if any(good in v for good in STATUS_GOOD):
+        return c(C.BOLD + C.B_GREEN, f"{emo(chr(0x1f7e2))}{value}")
+    if any(bad in v for bad in STATUS_BAD):
+        return c(C.BOLD + C.B_RED, f"{emo(chr(0x1f534))}{value}")
+    return c(C.BOLD + C.B_YELLOW, f"{emo(chr(0x1f7e1))}{value}")
+
+
+def kv(label, value):
+    print(f"  {c(C.BOLD, f'{label:<13}')} {value}")
+
+
+def ref(name, partition):
+    """Human-friendly 'name (partition)' reference, replacing the F5
+    internal '~partition~name' notation in output (still used internally
+    for REST paths, just not shown to the user)."""
+    return f"{c(C.BOLD, name)} {c(C.DIM, f'({partition})')}"
+
+
+DRAIN_FRAMES = ("\u231b", "\u23f3")  # hourglass done / hourglass flowing
+
+
+def vlog(verbose, text):
+    """Verbose diagnostic line, always sent to stderr so stdout stays clean
+    for scripting even with --verbose on."""
+    if verbose:
+        print(ce(C.DIM, f"  {emo(chr(0x1f50d), USE_COLOR_ERR)}[verbose] {text}"),
+              file=sys.stderr)
+
+
+class F5Client:
+    def __init__(self, host, username, password, verify=True, verbose=False,
+                 timeout=30):
+        self.host = host.rstrip("/")
+        self.auth = (username, password)
+        self.verify = verify
+        self.verbose = verbose
+        self.timeout = timeout
+
+    def _context(self):
+        if self.verify:
+            return None
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def request(self, method, path, data=None):
+        # BIG-IP's selfLink is always returned as an absolute URL with the
+        # host hardcoded to "localhost" (a long-standing iControl REST
+        # quirk), regardless of the management address actually queried.
+        # Strip any scheme+host from `path` and always target our
+        # configured self.host so selfLink-based calls (get_state,
+        # set_admin_status) hit the real BIG-IP instead of being naively
+        # concatenated into a malformed URL.
+        path = "/" + path.split("://", 1)[-1].split("/", 1)[-1] \
+            if "://" in path else path
+        url = self.host + path
+        payload = json.dumps(data).encode() if data is not None else None
+        vlog(self.verbose, f"{method} {path}"
+             + (f" body={json.dumps(data)}" if data is not None else ""))
+        req = urllib.request.Request(url, data=payload, method=method)
+        if payload is not None:
+            # Without an explicit Content-Type, urllib defaults PUT/POST
+            # bodies to application/x-www-form-urlencoded, which BIG-IP
+            # rejects outright (HTTP 415) -- iControl REST requires JSON.
+            req.add_header("Content-Type", "application/json")
+        token = base64.b64encode(
+            f"{self.auth[0]}:{self.auth[1]}".encode()
+        ).decode()
+        req.add_header("Authorization", f"Basic {token}")
+        ctx = self._context()
+        start = time.time()
+        try:
+            with urllib.request.urlopen(
+                req, context=ctx, timeout=self.timeout
+            ) as resp:
+                body = resp.read().decode()
+                elapsed = time.time() - start
+                vlog(self.verbose,
+                     f"  -> {resp.status} ({len(body)} bytes, "
+                     f"{elapsed:.2f}s)")
+                return resp.status, (json.loads(body) if body else {})
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            vlog(self.verbose, f"  -> HTTP {e.code} ({len(body)} bytes)")
+            raise F5Error(
+                f"HTTP {e.code} {method} {path}: {body}"
+            ) from None
+        except urllib.error.URLError as e:
+            vlog(self.verbose, f"  -> failed: {e.reason}")
+            raise F5Error(f"Cannot reach {self.host}: {e.reason}") from None
+        except TimeoutError as e:
+            # A read/connect timeout past urllib's own retry surfaces as a
+            # bare TimeoutError, not wrapped in URLError -- catch it
+            # separately so callers (notably `__complete`) can rely on
+            # every network failure being an F5Error.
+            vlog(self.verbose, f"  -> timed out: {e}")
+            raise F5Error(
+                f"timed out after {self.timeout}s: {method} {path}"
+            ) from None
+
+    def resolve_member(self, partition, pool, member):
+        """Return the member object from the pool's members collection.
+
+        `member` may be either the member's IP address or its BIG-IP node
+        name -- pool members are often created against a named node (e.g.
+        "web03") rather than a raw IP, so the member's REST "name" field is
+        "<node-name-or-ip>:<port>", while its "address" field always holds
+        the resolved IP. Accepting either lets you target a member without
+        needing to know its port.
+
+        `member` may optionally include ":<port>" (e.g. "web03:80") to
+        disambiguate when a pool happens to have the same node/IP on more
+        than one port. Matching is case-insensitive (node names are
+        commonly typed/pasted in whatever case the caller has handy).
+
+        Returns the single matching member dict. Raises F5Error listing the
+        candidates if more than one member matches (ambiguous) or none do.
+        """
+        ref = f"/mgmt/tm/ltm/pool/~{partition}~{pool}/members"
+        _, body = self.request("GET", ref)
+        items = body.get("items", [])
+        vlog(self.verbose,
+             f"searching {len(items)} member(s) in pool for {member!r}")
+
+        # Only treat a trailing ":<digits>" as an explicit port -- avoids
+        # misparsing an IPv6 address (which also contains colons) as
+        # "address:port".
+        head, _, tail = member.rpartition(":")
+        wanted_id, wanted_port = (head, tail) if head and tail.isdigit() \
+            else (member, None)
+        wanted_id_ci = wanted_id.lower()
+
+        matches = []
+        for item in items:
+            name_field = item.get("name", "").split("~")[-1]
+            name_id, _, name_port = name_field.rpartition(":")
+            if name_id.lower() != wanted_id_ci \
+                    and item.get("address", "").lower() != wanted_id_ci:
+                continue
+            if wanted_port is not None and name_port != wanted_port:
+                continue
+            matches.append(item)
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            options = ", ".join(
+                m.get("name", "?").split("~")[-1] for m in matches
+            )
+            raise F5Error(
+                f"{member!r} matches {len(matches)} members in pool "
+                f"{pool!r}: {options}. Add the port to disambiguate, "
+                f"e.g. --member {matches[0].get('name', '').split('~')[-1]}"
+            )
+        return None
+
+    def get_state(self, selfLink):
+        _, body = self.request("GET", selfLink)
+        return body
+
+    def get_stats(self, selfLink):
+        """Fetch a member's /stats sub-resource and flatten the deeply
+        nested tmsh stats shape into a flat {key: value/description} dict.
+
+        Connection counts, current session count, and monitor status text
+        live only under /stats -- they are not present on the member
+        config object itself (that object only has admin state via
+        "session" and operational state via "state").
+        """
+        path = selfLink.rstrip("/")
+        # selfLink may carry a "?ver=..." query string; insert /stats
+        # before it rather than naively appending, so the query string
+        # still applies to the /stats call.
+        if "?" in path:
+            base, _, query = path.partition("?")
+            path = f"{base}/stats?{query}"
+        else:
+            path = f"{path}/stats"
+        _, body = self.request("GET", path)
+        flat = {}
+        for entry in body.get("entries", {}).values():
+            for k, v in entry.get("nestedStats", {}).get("entries", {}).items():
+                flat[k] = v.get("value", v.get("description"))
+        return flat
+
+    def set_admin_status(self, selfLink, enabled):
+        """Set the member's administrative state.
+
+        BIG-IP's member config uses "session" for this (not "adminStatus"):
+        "user-enabled" puts it back in rotation, "user-disabled" takes it
+        out of rotation without the health monitor recording a failure
+        (it stays "up" but session shows disabled).
+        """
+        self.request(
+            "PUT", selfLink,
+            {"session": "user-enabled" if enabled else "user-disabled"},
+        )
+
+    def list_partitions(self):
+        """Return the top-level partitions (administrative partitions, not
+        sub-folders) visible with the current credentials.
+
+        BIG-IP enforces partition ACLs at the API layer, so a
+        non-administrative account querying /mgmt/tm/sys/folder only ever
+        sees folders it has access to -- no separate permissions lookup is
+        needed to answer "what can I see".
+        """
+        _, body = self.request("GET", "/mgmt/tm/sys/folder")
+        partitions = []
+        for item in body.get("items", []):
+            full_path = item.get("fullPath", "")
+            # A top-level partition's fullPath is exactly "/<name>" (one
+            # slash). Sub-folders nested inside a partition have additional
+            # slashes (e.g. "/myApp/subfolder") and are excluded.
+            if full_path != "/" and full_path.count("/") == 1:
+                partitions.append(item)
+        return partitions
+
+    def list_pools(self, partition=None):
+        """Return pool objects, optionally filtered to one partition.
+
+        Filtering is done client-side after fetching the full collection
+        (rather than via an iControl REST $filter query) to sidestep
+        version-specific quirks in $filter syntax/quoting. The match is
+        case-insensitive because BIG-IP's default partition is "Common"
+        (capitalized) while this tool's --partition default is "common".
+        """
+        _, body = self.request("GET", "/mgmt/tm/ltm/pool")
+        items = body.get("items", [])
+        if partition:
+            items = [i for i in items
+                     if i.get("partition", "").lower() == partition.lower()]
+        return items
+
+    def count_pool_members(self, partition, pool):
+        ref = f"/mgmt/tm/ltm/pool/~{partition}~{pool}/members"
+        _, body = self.request("GET", ref)
+        return len(body.get("items", []))
+
+    def list_pool_members(self, partition, pool):
+        """Return each member's name/address/port/status/health-monitor
+        detail for one pool.
+        """
+        ref = f"/mgmt/tm/ltm/pool/~{partition}~{pool}/members"
+        _, body = self.request("GET", ref)
+        return body.get("items", [])
+
+
+# Icon per action, purely cosmetic -- helps eyeball which command ran in a
+# scrollback full of them.
+ACTION_ICONS = {
+    "status": "\U0001f50e",
+    "disable": "\u23f8\ufe0f",
+    "enable": "\u25b6\ufe0f",
+}
+
+
+def resolve(args, client, action):
+    header(f"{action}: {args.pool} ({args.partition}) "
+           f"\u2192 {args.member}",
+           icon=ACTION_ICONS.get(action, "\U0001f527"))
+    member = client.resolve_member(args.partition, args.pool, args.member)
+    if member is None:
+        raise F5Error(
+            f"member {args.member!r} not found in pool "
+            f"{args.pool!r} (partition {args.partition!r})"
+        )
+    dim(f"{emo(chr(0x1f4cd))}resolved -> {member.get('name')}")
+    return member["selfLink"]
+
+
+def wait_drained(client, selfLink, max_wait, poll, force):
+    deadline = time.time() + max_wait
+    attempt = 0
+    while True:
+        attempt += 1
+        stats = client.get_stats(selfLink)
+        active = stats.get("serverside.curConns", 0) or 0
+        remaining = max(0, int(deadline - time.time()))
+        vlog(client.verbose,
+             f"drain poll #{attempt}: serverside.curConns={active}, "
+             f"{remaining}s remaining")
+        if active == 0:
+            return True
+        if time.time() >= deadline:
+            if force:
+                warn(f"{active} connection(s) still active after "
+                     f"{max_wait}s; proceeding (--force)")
+                return True
+            raise F5Error(
+                f"{active} connection(s) still active after {max_wait}s; "
+                "aborting. Use --force to proceed anyway."
+            )
+        spinner = DRAIN_FRAMES[attempt % len(DRAIN_FRAMES)]
+        line = (f"{emo(spinner)}draining... {active} active connection(s), "
+                f"{remaining}s left (poll #{attempt})")
+        info(line) if attempt == 1 else dim(line)
+        time.sleep(poll)
+
+
+def _print_member_status(member, stats):
+    name_field = member.get("name", "?").split("~")[-1]
+    node_id, _, port = name_field.rpartition(":")
+    addr = member.get("address", "?")
+    label = f"{node_id}  {c(C.DIM, addr)}" if node_id != addr else addr
+    print(f"  {emo(chr(0x1f5a5))}{c(C.BOLD + C.B_CYAN, label)}:{port}")
+    kv("session", status_badge(member.get("session")))
+    kv("state", status_badge(member.get("state")))
+    kv("monitor", member.get("monitor", "default").strip() or "default")
+    kv("monitorStatus", status_badge(stats.get("monitorStatus")))
+    kv("curConns", stats.get("serverside.curConns", 0))
+    kv("curSessions", stats.get("curSessions", 0))
+    kv("totRequests", stats.get("totRequests", 0))
+
+
+def cmd_status(args, client):
+    if not getattr(args, "member", None):
+        # No --member given: list every member in the pool with full
+        # status detail, same as a single-member `status` but repeated
+        # per member (mirrors list-members, with the fuller stats-backed
+        # detail status normally shows).
+        header(f"status: {args.pool} ({args.partition}) "
+               "\u2192 all members", icon=ACTION_ICONS.get("status"))
+        members = client.list_pool_members(args.partition, args.pool)
+        if not members:
+            warn(f"no members found in pool {args.pool!r} "
+                 f"(partition {args.partition!r}).")
+            return
+        for i, m in enumerate(sorted(members, key=lambda i: i.get("name", ""))):
+            if i:
+                print()
+            stats = client.get_stats(m["selfLink"])
+            _print_member_status(m, stats)
+        fun(f"{len(members)} member(s) found.", icon="\u2728")
+        return
+    selfLink = resolve(args, client, "status")
+    state = client.get_state(selfLink)
+    stats = client.get_stats(selfLink)
+    _print_member_status(state, stats)
+
+
+def cmd_list_partitions(args, client):
+    header("partitions", icon="\U0001f4c2")
+    partitions = client.list_partitions()
+    if not partitions:
+        warn("no partitions visible with these credentials.")
+        return
+    for p in sorted(partitions, key=lambda i: i.get("name", "")):
+        name = p.get("name", "?")
+        desc = p.get("description")
+        line = f"  {emo(chr(0x1f4c1))}{c(C.BOLD + C.B_CYAN, name)}"
+        print(line + (c(C.DIM, f"  # {desc}") if desc else ""))
+    fun(f"{len(partitions)} partition(s) visible.", icon="\u2728")
+
+
+def cmd_list_pools(args, client):
+    partition = None if args.all_partitions else args.partition
+    header("pools" + (f" in {partition}" if partition else " (all partitions)"),
+           icon="\U0001f3ca")
+    pools = client.list_pools(partition)
+    if not pools:
+        scope = f"partition {partition!r}" if partition else "any visible partition"
+        warn(f"no pools found in {scope}.")
+        return
+    for pool in sorted(pools, key=lambda i: (i.get("partition", ""), i.get("name", ""))):
+        name = pool.get("name", "?")
+        part = pool.get("partition", "?")
+        lb_mode = pool.get("loadBalancingMode", "?")
+        line = f"  {emo(chr(0x1f30a))}{c(C.BOLD + C.B_CYAN, name)} {c(C.DIM, f'({part})')}"
+        info_bits = [f"lb={lb_mode}"]
+        if args.with_members:
+            try:
+                n = client.count_pool_members(part, name)
+                info_bits.append(f"members={n}")
+            except F5Error as e:
+                info_bits.append(f"members=? ({e})")
+        print(f"{line}  " + c(C.DIM, "(" + ", ".join(info_bits) + ")"))
+    fun(f"{len(pools)} pool(s) found.", icon="\u2728")
+
+
+def cmd_list_members(args, client):
+    header(f"members: {args.pool} ({args.partition})", icon="\U0001f4cb")
+    members = client.list_pool_members(args.partition, args.pool)
+    if not members:
+        warn(f"no members found in pool {args.pool!r} "
+             f"(partition {args.partition!r}).")
+        return
+    for m in sorted(members, key=lambda i: i.get("name", "")):
+        name_field = m.get("name", "?").split("~")[-1]
+        node_id, _, port = name_field.rpartition(":")
+        addr = m.get("address", "?")
+        # node_id is the node name if one was given at creation time,
+        # otherwise it's the same as the IP -- only show it separately
+        # when it actually differs, to avoid noisy "10.1.2.3 (10.1.2.3)".
+        label = f"{node_id}  {c(C.DIM, addr)}" if node_id != addr else addr
+        line = f"  {emo(chr(0x1f5a5))}{c(C.BOLD + C.B_CYAN, label)}:{port}"
+        print(line)
+        print(f"      session  {status_badge(m.get('session'))}"
+              f"    state  {status_badge(m.get('state'))}")
+        monitor = m.get("monitor", "").strip() or "default"
+        dim(f"    monitor: {monitor}")
+    fun(f"{len(members)} member(s) found.", icon="\u2728")
+
+
+def cmd_complete(args, client):
+    """Print one candidate per line, plain text, no color/emoji -- consumed
+    by the bash/zsh completion scripts, not meant for human eyes. Errors
+    are swallowed (exit 0, no output) so a slow/unreachable BIG-IP degrades
+    to "no completions" rather than spamming a stack trace into the
+    terminal every time the user presses Tab.
+    """
+    try:
+        if args.kind == "partitions":
+            for p in client.list_partitions():
+                print(p.get("name", ""))
+        elif args.kind == "pools":
+            partition = None if getattr(args, "all_partitions", False) \
+                else args.partition
+            for pool in client.list_pools(partition):
+                print(pool.get("name", ""))
+        elif args.kind == "members":
+            if not getattr(args, "pool", None):
+                return
+            for m in client.list_pool_members(args.partition, args.pool):
+                name_field = m.get("name", "?").split("~")[-1]
+                node_id, _, _port = name_field.rpartition(":")
+                print(node_id)
+    except F5Error:
+        pass
+
+
+def cmd_disable(args, client):
+    selfLink = resolve(args, client, "disable")
+    if args.dry_run:
+        state = client.get_state(selfLink)
+        stats = client.get_stats(selfLink)
+        active = stats.get("serverside.curConns", 0) or 0
+        dim(f"{emo(chr(0x1f9ea))}[dry-run] would set session "
+            f"'user-disabled' (current: {state.get('session')})")
+        dim(f"{emo(chr(0x1f9ea))}[dry-run] would wait for drain "
+            f"(currently {active} active connection(s))")
+        return
+    client.set_admin_status(selfLink, False)
+    info("session -> user-disabled; draining active connections...",
+         icon="\u23f8\ufe0f")
+    if wait_drained(client, selfLink, args.max_wait, args.poll, args.force):
+        fun("drained (or timeout reached).", icon="\U0001f4a7")
+
+
+def cmd_enable(args, client):
+    selfLink = resolve(args, client, "enable")
+    if args.dry_run:
+        state = client.get_state(selfLink)
+        dim(f"{emo(chr(0x1f9ea))}[dry-run] would set session "
+            f"'user-enabled' (current: {state.get('session')})")
+        return
+    client.set_admin_status(selfLink, True)
+    fun("session -> user-enabled.", icon="\U0001f7e2")
+
+
+def _expand(path):
+    return os.path.expanduser(path) if path else path
+
+
+def check_config_perms(path):
+    """Refuse to load a config that exposes the password to other users."""
+    mode = os.stat(path).st_mode & 0o777
+    if mode & 0o077:
+        err(f"{path} is accessible by group/other (mode {oct(mode)}); "
+            "it holds a secret password")
+        print(f"       chmod 600 {_expand(path)}", file=sys.stderr)
+        sys.exit(2)
+
+
+def config_format(path):
+    """Pick a config file format from its extension.
+
+    ".toml" and ".json" are explicit. Anything else (including no
+    extension) defaults to TOML, since that's the default format this
+    tool writes (see default_config_path/maybe_init_config).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".json":
+        return "json"
+    return "toml"
+
+
+def _flatten_sections(data):
+    """Support optional [connection] / [member] table headers in the config.
+
+    Config files may group related keys under `[connection]` (host, user,
+    password) and `[member]` (pool, member, partition) table headers
+    for readability, or set them all as flat top-level keys (the older
+    style, still supported). This merges known section tables into the
+    top-level namespace so the rest of the code can keep reading flat keys
+    (`config.get("host")`, etc.) regardless of which style was used.
+    A flat top-level key wins over the same key nested in a section, in
+    case a file somehow sets both.
+    """
+    flat = dict(data)
+    for section in ("connection", "member"):
+        value = data.get(section)
+        if isinstance(value, dict):
+            # The section header itself becomes a flat key pointing at the
+            # sub-table dict (from the `dict(data)` copy above) -- drop it
+            # once its contents have been merged up, so e.g. a [member]
+            # section doesn't leave a bogus flat "member" key holding
+            # {"pool": ..., "partition": ...} instead of the actual member
+            # identity string.
+            del flat[section]
+            for k, v in value.items():
+                flat.setdefault(k, v)
+    return flat
+
+
+def load_config(path):
+    """Load connection defaults from a TOML (default) or JSON config file.
+
+    Accepts flat top-level keys (host/user/password/pool/member/
+    partition) or the same keys grouped under `[connection]` and `[member]`
+    table headers -- see _flatten_sections(). `address` is still accepted
+    as a legacy alias for `member` (see main()).
+    """
+    if not path:
+        return {}
+    path = _expand(path)
+    fmt = config_format(path)
+    try:
+        if fmt == "toml":
+            if tomllib is None:
+                raise F5Error(
+                    f"cannot read TOML config file {path}: TOML support "
+                    "requires Python 3.11+ (tomllib). Use a .json config "
+                    "file instead, or upgrade Python."
+                )
+            with open(path, "rb") as fh:
+                data = tomllib.load(fh)
+        else:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+    except FileNotFoundError:
+        raise F5Error(f"config file not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise F5Error(f"invalid JSON in config file {path}: {exc}")
+    except OSError as exc:
+        raise F5Error(f"cannot read config file {path}: {exc}")
+    except Exception as exc:
+        if tomllib is not None and isinstance(exc, tomllib.TOMLDecodeError):
+            raise F5Error(f"invalid TOML in config file {path}: {exc}")
+        raise
+    if not isinstance(data, dict):
+        kind = "TOML table" if fmt == "toml" else "JSON object"
+        raise F5Error(f"config file {path} must contain a top-level {kind}")
+    check_config_perms(path)
+    return _flatten_sections(data)
+
+
+def default_config_path():
+    """Location of the config file: $LBCTL_CONFIG or ~/.lbctl.toml."""
+    return os.environ.get("LBCTL_CONFIG") or "~/.lbctl.toml"
+
+
+def maybe_init_config(config_path):
+    """Create the config file with a template if it does not already exist."""
+    path = _expand(config_path)
+    if os.path.exists(path):
+        print(f"config already exists at {path}")
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if config_format(path) == "json":
+        template = (
+            "{\n"
+            '  "host": "https://your-bigip.example.com",\n'
+            '  "user": "your-f5-username",\n'
+            '  "password": "your-f5-password"\n'
+            "}\n"
+        )
+    else:
+        template = (
+            "[connection]\n"
+            'host = "https://your-bigip.example.com"\n'
+            'user = "your-f5-username"\n'
+            'password = "your-f5-password"\n'
+            "\n"
+            "# Skip TLS certificate verification (BIG-IP's default "
+            "self-signed cert).\n"
+            "# Same as passing --no-verify on every invocation.\n"
+            "# insecure = true\n"
+            "\n"
+            "# Optionally pin the member identity here too, so no other\n"
+            "# flags are needed on the command line:\n"
+            "[member]\n"
+            '# pool = "web_pool"\n'
+            '# member = "10.1.2.3"\n'
+            '# partition = "common"\n'
+        )
+    try:
+        with open(path, "w") as fh:
+            fh.write(template)
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise F5Error(f"cannot create config file {path}: {exc}")
+    print(f"created config at {path} (mode 600) -- edit it with your "
+          "credentials")
+
+
+def build_parser():
+    # Connection args live in a shared parent with default=SUPPRESS on both the
+    # main parser and each subcommand, so they can be given before or after the
+    # subcommand. required=True cannot be used there (argparse can't tell which
+    # copy the value landed in), so it is enforced manually in main().
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--host", "-H", default=argparse.SUPPRESS,
+                        help="BIG-IP management hostname/IP "
+                             "(CLI > config > F5_URL)")
+    common.add_argument("--user", "-u", default=argparse.SUPPRESS,
+                        help="BIG-IP username (CLI > config > F5_USER)")
+    common.add_argument("--password", default=argparse.SUPPRESS,
+                        help="BIG-IP password (CLI > config > F5_PASSWORD). "
+                             "Avoid argv for security.")
+    common.add_argument("-c", "--config", default=argparse.SUPPRESS,
+                        help="TOML (or .json) config file with connection "
+                             "defaults (default: $LBCTL_CONFIG or "
+                             "~/.lbctl.toml)")
+    common.add_argument("-i", "--init-config", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="Create the config file (with a template) if it "
+                             "does not exist, then exit")
+    common.add_argument("--no-verify", default=argparse.SUPPRESS,
+                        action="store_true",
+                        help="Skip TLS certificate verification "
+                             "(self-signed certs). Also settable in the "
+                             "config file as insecure = true")
+    common.add_argument("--verbose", "-v", default=argparse.SUPPRESS,
+                        action="store_true",
+                        help="Log every REST call (method, path, response "
+                             "status/timing) to stderr")
+    common.add_argument("--partition", "-p", default="common",
+                        help="Partition containing the pool and member "
+                             "(default: common)")
+    common.add_argument("--pool", "-P", default=argparse.SUPPRESS,
+                        help="Pool name (required)")
+    common.add_argument("--member", "-m", default=argparse.SUPPRESS,
+help="Member node IP address or BIG-IP node name. "
+                              "Required for disable/enable; optional for "
+                              "status (omit to list every member in the "
+                              "pool)")
+
+    p = argparse.ArgumentParser(
+        prog="lbctl", parents=[common],
+        description=__doc__.split("\n")[0]
+    )
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
+    # required=False: -i/--init-config only needs the top-level parser (no
+    # subcommand), so it can be used as `lbctl -i` on its own. main()
+    # checks for a command manually once init-config's short-circuit has
+    # had a chance to run.
+    sub = p.add_subparsers(dest="command", required=False)
+
+    def add_drain(sp):
+        sp.add_argument("--max-wait", type=int, default=DEFAULT_MAX_WAIT,
+                        help="Seconds to wait for drain before giving up "
+                              f"(default: {DEFAULT_MAX_WAIT})")
+        sp.add_argument("--poll", type=int, default=DEFAULT_POLL_INTERVAL,
+                        help="Seconds between drain checks "
+                              f"(default: {DEFAULT_POLL_INTERVAL})")
+        sp.add_argument("--force", action="store_true",
+                        help="Proceed even if connections remain after --max-wait")
+        sp.add_argument("--dry-run", "-n", action="store_true",
+                        help="Show what would change without making any "
+                             "API calls that modify state")
+        return sp
+
+    sub.add_parser(
+        "status", parents=[common],
+        help="show current member status (all members if --member omitted)"
+    ).set_defaults(func=cmd_status)
+    add_drain(sub.add_parser(
+        "disable", parents=[common],
+        help="set session=user-disabled and drain")).set_defaults(
+        func=cmd_disable)
+    add_drain(sub.add_parser(
+        "enable", parents=[common],
+        help="set session=user-enabled")).set_defaults(func=cmd_enable)
+
+    sub.add_parser(
+        "list-partitions", parents=[common], aliases=["partitions"],
+        help="list partitions visible with these credentials"
+    ).set_defaults(func=cmd_list_partitions)
+
+    list_pools_parser = sub.add_parser(
+        "list-pools", parents=[common], aliases=["pools"],
+        help="list pools visible with these credentials"
+    )
+    list_pools_parser.add_argument(
+        "--all-partitions", "-A", action="store_true",
+        help="list pools across all visible partitions, ignoring "
+             "--partition/-p (default: only the --partition given, or "
+             "'common')")
+    list_pools_parser.add_argument(
+        "--with-members", action="store_true",
+        help="also query and show each pool's member count (one extra "
+             "REST call per pool)")
+    list_pools_parser.set_defaults(func=cmd_list_pools)
+
+    sub.add_parser(
+        "list-members", parents=[common], aliases=["members"],
+        help="list a pool's members: name, address, port, availability, "
+             "health monitor"
+    ).set_defaults(func=cmd_list_members)
+
+    # Hidden helper used only by the bash/zsh completion scripts (see
+    # completions/) to dynamically complete --partition/--pool/--member
+    # values against the real BIG-IP. Not meant to be run by hand, hence
+    # argparse.SUPPRESS on its help text so it doesn't clutter --help.
+    complete_parser = sub.add_parser("__complete", parents=[common],
+                                      help=argparse.SUPPRESS)
+    complete_parser.add_argument(
+        "kind", choices=("partitions", "pools", "members")
+    )
+    complete_parser.add_argument("--all-partitions", "-A",
+                                  action="store_true")
+    complete_parser.set_defaults(func=cmd_complete)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    # --init-config seeds the config file and exits without contacting the
+    # load balancer, so it must run before the command-required check below
+    # (it needs no subcommand and none of the pool/address/port values).
+    if getattr(args, "init_config", False):
+        init_path = getattr(args, "config", None) or default_config_path()
+        try:
+            maybe_init_config(init_path)
+        except F5Error as e:
+            err(e)
+            return 1
+        return 0
+
+    # A subcommand is required for everything except --init-config (the
+    # subparsers are not required=True so that `lbctl -i` works alone).
+    if not getattr(args, "command", None):
+        err("missing command (status, disable, enable, "
+            "list-partitions, list-pools, list-members)")
+        return 2
+
+    # Load the config before checking pool/address/port, since those values
+    # may come from the config file instead of the CLI.
+    config_arg = getattr(args, "config", None)
+    if config_arg:
+        try:
+            config = load_config(config_arg)
+        except F5Error as e:
+            err(e)
+            return 1
+    else:
+        default_path = default_config_path()
+        # os.path.exists() does not expand "~", so it must be expanded here
+        # too or a default path of "~/.lbctl.toml" will never be found
+        # and the config file will be silently skipped.
+        config = (load_config(default_path)
+                  if os.path.exists(_expand(default_path)) else {})
+
+    # pool/member are required but enforced manually (see build_parser).
+    # CLI flags take precedence; fall back to the config file so a
+    # fully-populated config needs no other args at all.
+    if not getattr(args, "pool", None) and config.get("pool"):
+        args.pool = config["pool"]
+    if not getattr(args, "member", None) and (
+        config.get("member") or config.get("address")
+    ):
+        args.member = config.get("member") or config.get("address")
+    if getattr(args, "partition", "common") == "common" and config.get("partition"):
+        args.partition = config["partition"]
+    # --no-verify can also be set in the config (as "no_verify" or the more
+    # readable alias "insecure"), e.g. for a lab BIG-IP with a self-signed
+    # cert you don't want to pass --no-verify on every invocation.
+    if not getattr(args, "no_verify", False) and (
+        config.get("no_verify") or config.get("insecure")
+    ):
+        args.no_verify = True
+
+    # list-partitions/list-pools (and their aliases) are read-only discovery
+    # commands that operate on partitions/pools in general rather than one
+    # specific member, so they don't need pool/member at all.
+    # list-members needs --pool (it lists everything in that pool) but not
+    # --member, since it's not targeting one specific member.
+    # status also only needs --pool: --member narrows it to one member,
+    # but omitting it lists every member in the pool (like list-members,
+    # just with the fuller per-member status detail).
+    no_requirements_commands = {
+        "list-partitions", "partitions", "list-pools", "pools",
+        "__complete",
+    }
+    pool_only_commands = {"list-members", "members", "status"}
+    if args.command in pool_only_commands:
+        if not getattr(args, "pool", None):
+            err("missing --pool/-P")
+            return 2
+    elif args.command not in no_requirements_commands:
+        missing = []
+        for field, flags in (("pool", "--pool/-P"),
+                             ("member", "--member/-m")):
+            if not getattr(args, field, None):
+                missing.append(flags)
+        if missing:
+            err("missing " + ", ".join(missing))
+            return 2
+
+    host = (getattr(args, "host", None) or config.get("host")
+            or config.get("url") or config.get("f5_url")
+            or os.environ.get("F5_URL"))
+    user = getattr(args, "user", None) or config.get("user") \
+        or os.environ.get("F5_USER")
+    password = (getattr(args, "password", None) or config.get("password")
+                or config.get("passwd") or os.environ.get("F5_PASSWORD"))
+
+    # See the __complete guard below: same "just show nothing" rule
+    # applies here for a missing host/user, not just a missing password.
+    if args.command == "__complete" and not (host and user):
+        return 0
+
+    if not host:
+        err("missing --host/-H/--config/F5_URL")
+        return 2
+    if not re.match(r"^https?://", host):
+        err(f"--host/-H/F5_URL must start with http:// or https:// "
+            f"(got {host!r})")
+        return 2
+    if not user:
+        err("missing --user/-u/--config/F5_USER")
+        return 2
+
+    # __complete is invoked from a shell completion hook, potentially on
+    # every Tab press -- it must never block waiting for input (no
+    # password prompt) or spam errors to a terminal mid-typing. Missing
+    # credentials or an unreachable host just mean "no completions".
+    if args.command == "__complete" and not password:
+        return 0
+
+    if not password:
+        try:
+            password = getpass.getpass("F5 password: ")
+        except EOFError:
+            err("no F5 password provided (set F5_PASSWORD, a config "
+                "file, or pass --password)")
+            return 2
+    if not password:
+        err("empty F5 password")
+        return 2
+
+    if getattr(args, "password", None):
+        print("warning: passing --password on argv is insecure; prefer a "
+              "config file or F5_PASSWORD.", file=sys.stderr)
+
+    client = F5Client(host, user, password,
+                      verify=not getattr(args, "no_verify", False),
+                      verbose=getattr(args, "verbose", False),
+                      timeout=5 if args.command == "__complete" else 30)
+    try:
+        args.func(args, client)
+    except F5Error as e:
+        if args.command == "__complete":
+            return 0
+        err(e)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Exit quietly on Ctrl-C instead of dumping a KeyboardInterrupt
+        # traceback -- this can land mid password prompt or mid drain-wait
+        # sleep, so it must be caught at the top level to cover all of
+        # those cleanly. 130 is the conventional exit code for "terminated
+        # by SIGINT".
+        print(file=sys.stderr)
+        err("interrupted.")
+        sys.exit(130)

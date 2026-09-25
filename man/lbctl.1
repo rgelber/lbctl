@@ -1,0 +1,381 @@
+.TH LBCTL 1 "lbctl 0.1.0" "Sep 2026" "User Commands"
+
+.SH NAME
+lbctl \- Gracefully disable an F5 BIG-IP pool member for maintenance.
+
+.SYNOPSIS
+.B lbctl
+.I [global options]
+.IC command
+
+.SH DESCRIPTION
+.PP
+Gracefully disable an F5 BIG-IP pool member for maintenance.
+.PP
+Flow for `disable`: 1. Set the member's session to \(dquser-disabled\(sd
+(it leaves load-balancing rotation; the health monitor no longer governs
+it, so no monitor \(dqfailure\(sd is generated while the node comes
+out). 2. Wait for active connections to drain to zero (configurable
+timeout).
+.PP
+`enable` flips the session state back (\(dquser-enabled\(sd) to bring a
+node back into service. `disable` also covers a quick drain (with
+\&--max-wait 0), where you just want to pull a node out of rotation
+without waiting. `status` reports current state for one member
+(--member) or, if --member is omitted, every member in the pool.
+.PP
+`list-partitions`, `list-pools`, and `list-members` are read-only
+discovery commands: they list the administrative partitions, pools, and
+pool members visible with the configured credentials, so you can find
+the exact `--partition`/`--pool`/`--member` values to target before
+running `status`/`disable`/`enable`.
+.PP
+`--member`/`-m` accepts either the member's IP address or its BIG-IP
+node name -- pool members are often created against a named node rather
+than a raw IP, so this lets you target one the same way you'd refer to
+it in the F5 UI, without having to look up its IP or port first. A port
+is only needed (as `name:port`) if a pool happens to have the same
+node/IP on more than one port.
+
+.SH GLOBAL OPTIONS
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.B --version
+show program's version number and exit
+
+.SH COMMANDS
+.TP
+.B status
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.TP
+.B disable
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.B --max-wait
+Seconds to wait for drain before giving up (default: 300)
+.B --poll
+Seconds between drain checks (default: 5)
+.B --force
+Proceed even if connections remain after --max-wait
+.B --dry-run, -n
+Show what would change without making any API calls that modify state
+.TP
+.B enable
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.B --max-wait
+Seconds to wait for drain before giving up (default: 300)
+.B --poll
+Seconds between drain checks (default: 5)
+.B --force
+Proceed even if connections remain after --max-wait
+.B --dry-run, -n
+Show what would change without making any API calls that modify state
+.TP
+.B list-partitions
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.TP
+.B partitions
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.TP
+.B list-pools
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.B --all-partitions, -A
+list pools across all visible partitions, ignoring --partition/-p
+(default: only the --partition given, or 'common')
+.B --with-members
+also query and show each pool's member count (one extra REST call per
+pool)
+.TP
+.B pools
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.B --all-partitions, -A
+list pools across all visible partitions, ignoring --partition/-p
+(default: only the --partition given, or 'common')
+.B --with-members
+also query and show each pool's member count (one extra REST call per
+pool)
+.TP
+.B list-members
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.TP
+.B members
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.TP
+.B __complete
+.B --host, -H
+BIG-IP management hostname/IP (CLI > config > F5_URL)
+.B --user, -u
+BIG-IP username (CLI > config > F5_USER)
+.B --password
+BIG-IP password (CLI > config > F5_PASSWORD). Avoid argv for security.
+.B -c, --config
+TOML (or .json) config file with connection defaults (default:
+$LBCTL_CONFIG or ~/.lbctl.toml)
+.B -i, --init-config
+Create the config file (with a template) if it does not exist, then exit
+.B --no-verify
+Skip TLS certificate verification (self-signed certs). Also settable in
+the config file as insecure = true
+.B --verbose, -v
+Log every REST call (method, path, response status/timing) to stderr
+.B --partition, -p
+Partition containing the pool and member (default: common)
+.B --pool, -P
+Pool name (required)
+.B --member, -m
+Member node IP address or BIG-IP node name. Required for disable/enable;
+optional for status (omit to list every member in the pool)
+.B --all-partitions, -A
+
+.SH EXAMPLES
+.PP
+Check one member's state (name or IP works for --member):
+.RS
+\&.B lbctl --pool web_pool --member web03.example.com status
+.RE
+.PP
+List every member in a pool so you can pick one to target:
+.RS
+\&.B lbctl --pool web_pool list-members
+.RE
+.PP
+Disable a member and keep it (no prompt, no wait):
+.RS
+\&.B lbctl --pool web_pool --member 10.1.2.3 --disable
+.RE
+.PP
+Bring a previously disabled member back into rotation:
+.RS
+\&.B lbctl --pool web_pool --member web03.example.com --enable
+.RE
+
+.SH FILES
+.TP
+.I ~/.lbctl.toml
+Connection defaults (password included). The tool refuses to load it unless it is mode 600.
+
+.SH SEE ALSO
+.BR bash (1),
+.BR zsh (1)
+
+.SH AUTHORS
+lbctl was written by Ryan Gelber <ryangelber@gmail.com>.
+

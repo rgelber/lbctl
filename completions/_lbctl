@@ -1,0 +1,155 @@
+#compdef lbctl
+#
+# zsh completion for lbctl
+#
+# Install (pick one):
+#   Quick, this shell only:
+#     autoload -Uz compinit && compinit
+#     source /path/to/completions/_lbctl
+#
+#   Persistent, your own fpath directory:
+#     mkdir -p ~/.zsh/completions
+#     cp completions/_lbctl ~/.zsh/completions/_lbctl
+#     # in ~/.zshrc, before compinit:
+#     fpath=(~/.zsh/completions $fpath)
+#     autoload -Uz compinit && compinit
+#
+#   Homebrew (macOS), if lbctl is on your Homebrew PATH:
+#     cp completions/_lbctl "$(brew --prefix)/share/zsh/site-functions/_lbctl"
+#
+# Dynamic completion of --partition/--pool/--member shells out to
+# `lbctl __complete ...` (a hidden subcommand, see lbctl itself), reusing
+# whatever --host/--user/--password/--config/--no-verify/--partition/--pool
+# is already on the command line (falling back to your config file). It
+# never blocks for a password prompt and silently offers nothing if the
+# BIG-IP is slow/unreachable or credentials aren't resolvable yet.
+
+_lbctl_forward_args() {
+    local -a out
+    local i=2 n=${#words[@]}
+    while (( i < CURRENT )); do
+        case "${words[$i]}" in
+            --host|-H|--user|-u|--password|-c|--config|--partition|-p|--pool|-P)
+                # Only forward this flag if its value has also been typed
+                # already -- if the flag is the last word before the one
+                # currently being completed, its value doesn't exist yet
+                # and there's nothing usable to forward.
+                if (( i + 1 < CURRENT )); then
+                    out+=("${words[$i]}" "${words[$((i + 1))]}")
+                    (( i++ ))
+                fi
+                ;;
+            --no-verify)
+                out+=("--no-verify")
+                ;;
+        esac
+        (( i++ ))
+    done
+    (( ${#out[@]} > 0 )) && print -l -- "${out[@]}"
+}
+
+_lbctl_dynamic() {
+    # $1 = kind (partitions|pools|members), remaining = extra lbctl args
+    local kind="$1"
+    shift
+    local -a forwarded
+    local fwd_str
+    fwd_str="$(_lbctl_forward_args)"
+    # Splitting an empty string with (@f) still yields a one-element
+    # array containing "" (zsh quirk), which would get passed to lbctl
+    # as a bogus empty positional argument -- only split if non-empty.
+    [[ -n "$fwd_str" ]] && forwarded=("${(@f)fwd_str}")
+    lbctl __complete "$kind" "${forwarded[@]}" "$@" 2>/dev/null
+}
+
+_lbctl_partitions() {
+    local -a names
+    local out
+    out="$(_lbctl_dynamic partitions)"
+    [[ -n "$out" ]] && names=("${(@f)out}")
+    _describe -t partitions 'partition' names
+}
+
+_lbctl_pools() {
+    local -a extra names
+    local out
+    if [[ "${words[2]}" == list-pools || "${words[2]}" == pools ]]; then
+        extra=(--all-partitions)
+    fi
+    out="$(_lbctl_dynamic pools "${extra[@]}")"
+    [[ -n "$out" ]] && names=("${(@f)out}")
+    _describe -t pools 'pool' names
+}
+
+_lbctl_members() {
+    local -a names
+    local out
+    out="$(_lbctl_dynamic members)"
+    [[ -n "$out" ]] && names=("${(@f)out}")
+    _describe -t members 'member' names
+}
+
+_lbctl_common_args=(
+    '(--host -H)'{--host,-H}'[BIG-IP management hostname/IP]:host:'
+    '(--user -u)'{--user,-u}'[BIG-IP username]:user:'
+    '--password[BIG-IP password (avoid on argv)]:password:'
+    '(-c --config)'{-c,--config}'[config file with connection defaults]:file:_files'
+    '(-i --init-config)'{-i,--init-config}'[create the config file and exit]'
+    '--no-verify[skip TLS certificate verification]'
+    '(--verbose -v)'{--verbose,-v}'[log every REST call to stderr]'
+    '(--partition -p)'{--partition,-p}'[partition containing the pool/member]:partition:_lbctl_partitions'
+    '(--pool -P)'{--pool,-P}'[pool name]:pool:_lbctl_pools'
+    '(--member -m)'{--member,-m}'[member node IP or BIG-IP node name]:member:_lbctl_members'
+    '(- *)'{-h,--help}'[show help]'
+)
+
+_lbctl_drain_args=(
+    '--max-wait[seconds to wait for drain before giving up]:seconds:'
+    '--poll[seconds between drain checks]:seconds:'
+    '--force[proceed even if connections remain after --max-wait]'
+    '(--dry-run -n)'{--dry-run,-n}'[show what would change, make no changes]'
+)
+
+_lbctl() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -C \
+        "${_lbctl_common_args[@]}" \
+        '1: :->command' \
+        '*::arg:->args'
+
+    case "$state" in
+        command)
+            local -a commands=(
+                'status:show current member status (all members if --member omitted)'
+                'disable:set session=user-disabled and drain'
+                'enable:set session=user-enabled'
+                'list-partitions:list partitions visible with these credentials'
+                'partitions:alias for list-partitions'
+                'list-pools:list pools visible with these credentials'
+                'pools:alias for list-pools'
+                'list-members:list a pool'"'"'s members'
+                'members:alias for list-members'
+            )
+            _describe -t commands 'command' commands
+            ;;
+        args)
+            case "${words[1]}" in
+                disable|enable)
+                    _arguments "${_lbctl_common_args[@]}" "${_lbctl_drain_args[@]}"
+                    ;;
+                list-pools|pools)
+                    _arguments "${_lbctl_common_args[@]}" \
+                        '(--all-partitions -A)'{--all-partitions,-A}'[list pools across all visible partitions]' \
+                        '--with-members[also show each pool'"'"'s member count]'
+                    ;;
+                *)
+                    _arguments "${_lbctl_common_args[@]}"
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_lbctl "$@"

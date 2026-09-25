@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from Makefile
+        id: ver
+        run: |
+          VERSION="$(grep -E '^VERSION' Makefile | cut -d= -f2 | tr -d ' \"')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tar gzip rpm
+
+      - name: Build source tarball
+        run: make tarball VERSION="${{ steps.ver.outputs.version }}"
+
+      - name: Validate tarball & spec version agree
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          test -f "lbctl-${VER}.tar.gz" || { echo "missing tarball lbctl-${VER}.tar.gz"; exit 1; }
+          SPEC_VER="$(grep -E '^Version:' packaging/lbctl.spec | awk '{print $2}')"
+          test "$SPEC_VER" = "$VER" || { echo "spec Version=$SPEC_VER != $VER"; exit 1; }
+
+      - name: Build RPM
+        run: |
+          mkdir -p dist rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS}
+          cp lbctl-${{ steps.ver.outputs.version }}.tar.gz rpmbuild/SOURCES/
+          cp packaging/lbctl.spec rpmbuild/SPECS/
+          rpmbuild -bb --nocheck rpmbuild/SPECS/lbctl.spec
+          cp rpmbuild/RPMS/noarch/*.rpm dist/
+
+      - name: Create GitHub release
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          NOTES="$(awk '/^%changelog/{f=1;next} f&&/^*/{print;exit}' packaging/lbctl.spec)"
+          gh release create "v${VER}" --title "lbctl ${VER}" --notes "$NOTES" dist/*
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
