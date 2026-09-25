@@ -9,6 +9,7 @@ DESTDIR ?=
 BINDIR      = $(DESTDIR)$(PREFIX)/bin
 BASHCOMPDIR = $(DESTDIR)$(PREFIX)/share/bash-completion/completions
 ZSHCOMPDIR  = $(DESTDIR)$(PREFIX)/share/zsh/site-functions
+MANDIR      = $(DESTDIR)$(PREFIX)/share/man/man1
 
 # Values mirror the spec file (packaging/lbctl.spec); keep them in sync.
 NAME    = lbctl
@@ -34,17 +35,21 @@ install:
 	$(INSTALL_DATA) completions/lbctl.bash $(BASHCOMPDIR)/lbctl
 	$(INSTALL_DIR) $(ZSHCOMPDIR)
 	$(INSTALL_DATA) completions/_lbctl $(ZSHCOMPDIR)/_lbctl
+	$(INSTALL_DIR) $(MANDIR)
+	$(INSTALL_DATA) man/lbctl.1 $(MANDIR)/lbctl.1
 
 uninstall:
 	rm -f $(BINDIR)/lbctl
 	rm -f $(BASHCOMPDIR)/lbctl
 	rm -f $(ZSHCOMPDIR)/_lbctl
+	rm -f $(MANDIR)/lbctl.1
 
 check:
 	python3 -m py_compile lbctl
 	bash -n completions/lbctl.bash
 	zsh -n completions/_lbctl
 	python3 -m unittest discover -s tests
+	python3 scripts/manpage.py --check
 
 clean:
 	rm -rf __pycache__

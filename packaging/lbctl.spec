@@ -32,6 +32,9 @@ reach zero) or flip it back on. Ships with bash and zsh tab completions for
 # Install from the Makefile -- the single source of truth for install paths.
 # Nothing to build first.
 make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
+# gzip the man page to lbctl.1.gz. This is idempotent with rpmbuild's
+# brp-compress post, and covers build environments where that post is absent.
+%__gzip %{buildroot}%{_mandir}/man1/lbctl.1
 # Remove any bytecode the Makefile's py_compile check might have produced.
 find %{buildroot} -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
@@ -39,6 +42,7 @@ find %{buildroot} -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || t
 %{_bindir}/lbctl
 %{_datadir}/bash-completion/completions/lbctl
 %{_datadir}/zsh/site-functions/_lbctl
+%{_mandir}/man1/lbctl.1.gz
 
 %changelog
 * Fri Sep 25 2026 - Ryan Gelber <ryangelber@gmail.com> - 0.1.0

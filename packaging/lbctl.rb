@@ -12,9 +12,11 @@ class Lbctl < Formula
     bin.install "lbctl"
     share.install "completions/lbctl.bash" => "bash-completion/completions/lbctl"
     share.install "completions/_lbctl" => "zsh/site-functions/_lbctl"
+    share.install "man/lbctl.1" => "man/man1/lbctl.1"
   end
 
   test do
     assert_equal `#{bin}/lbctl --version`.strip, "lbctl 0.1.0"
+    assert_path_exist share.join("man/man1/lbctl.1")
   end
 end
