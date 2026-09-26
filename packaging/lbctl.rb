@@ -1,8 +1,8 @@
 class Lbctl < Formula
   desc "Gracefully manage load balancer pool members for maintenance"
   homepage "https://github.com/rgelber/lbctl"
-  url "https://github.com/rgelber/lbctl/archive/refs/tags/v0.1.0.tar.gz"
-  version "0.1.0"
+  url "https://github.com/rgelber/lbctl/archive/refs/tags/v0.2.0.tar.gz"
+  version "0.2.0"
   license "MIT"
 
   # Self-contained, stdlib-only Python 3 script -- uses whatever `python3`
@@ -16,7 +16,7 @@ class Lbctl < Formula
   end
 
   test do
-    assert_equal `#{bin}/lbctl --version`.strip, "lbctl 0.1.0"
+    assert_equal `#{bin}/lbctl --version`.strip, "lbctl 0.2.0"
     assert_path_exist share.join("man/man1/lbctl.1")
   end
 end

@@ -1,5 +1,5 @@
 Name:           lbctl
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Gracefully manage load balancer pool members for maintenance
 
@@ -45,5 +45,8 @@ find %{buildroot} -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || t
 %{_mandir}/man1/lbctl.1.gz
 
 %changelog
+* Fri Sep 25 2026 - Ryan Gelber <ryangelber@gmail.com> - 0.2.0
+- Ship lbctl(1) man page via make install, RPM, and Homebrew.
+
 * Fri Sep 25 2026 - Ryan Gelber <ryangelber@gmail.com> - 0.1.0
 - Initial package.

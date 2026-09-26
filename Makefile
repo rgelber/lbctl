@@ -13,7 +13,7 @@ MANDIR      = $(DESTDIR)$(PREFIX)/share/man/man1
 
 # Values mirror the spec file (packaging/lbctl.spec); keep them in sync.
 NAME    = lbctl
-VERSION = 0.1.0
+VERSION = 0.2.0
 TARBALL = $(NAME)-$(VERSION).tar.gz
 RPMSPEC = packaging/lbctl.spec
 

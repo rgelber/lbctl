@@ -80,11 +80,11 @@ executable plus the bash and zsh completions. Build the source tarball and RPM:
 ```sh
 make tarball
 mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS}
-cp lbctl-0.1.0.tar.gz ~/rpmbuild/SOURCES/
+cp lbctl-0.2.0.tar.gz ~/rpmbuild/SOURCES/
 cp packaging/lbctl.spec ~/rpmbuild/SPECS/
 rpmbuild -ba ~/rpmbuild/SPECS/lbctl.spec
-# Result: ~/rpmbuild/RPMS/noarch/lbctl-0.1.0-1.noarch.rpm
-sudo rpm -i ~/rpmbuild/RPMS/noarch/lbctl-0.1.0-1.noarch.rpm
+# Result: ~/rpmbuild/RPMS/noarch/lbctl-0.2.0-1.noarch.rpm
+sudo rpm -i ~/rpmbuild/RPMS/noarch/lbctl-0.2.0-1.noarch.rpm
 ```
 
 The Makefile is the single source of truth for install paths, so the RPM uses
