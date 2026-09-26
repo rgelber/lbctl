@@ -40,6 +40,7 @@ jobs:
       - name: Build RPM
         run: |
           mkdir -p dist $HOME/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS}
+          cp lbctl-${{ steps.ver.outputs.version }}.tar.gz dist/
           cp lbctl-${{ steps.ver.outputs.version }}.tar.gz $HOME/rpmbuild/SOURCES/
           cp packaging/lbctl.spec $HOME/rpmbuild/SPECS/
           rpmbuild -bb --nocheck $HOME/rpmbuild/SPECS/lbctl.spec
@@ -49,6 +50,7 @@ jobs:
         run: |
           VER="${{ steps.ver.outputs.version }}"
           NOTES="$(awk '/^%changelog/{f=1;next} f&&/^*/{print;exit}' packaging/lbctl.spec)"
+          gh release delete "v${VER}" >/dev/null 2>&1 || true
           gh release create "v${VER}" --title "lbctl ${VER}" --notes "$NOTES" dist/*
         env:
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
