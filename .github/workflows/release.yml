@@ -39,11 +39,11 @@ jobs:
 
       - name: Build RPM
         run: |
-          mkdir -p dist rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS}
-          cp lbctl-${{ steps.ver.outputs.version }}.tar.gz rpmbuild/SOURCES/
-          cp packaging/lbctl.spec rpmbuild/SPECS/
-          rpmbuild -bb --nocheck rpmbuild/SPECS/lbctl.spec
-          cp rpmbuild/RPMS/noarch/*.rpm dist/
+          mkdir -p dist $HOME/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS}
+          cp lbctl-${{ steps.ver.outputs.version }}.tar.gz $HOME/rpmbuild/SOURCES/
+          cp packaging/lbctl.spec $HOME/rpmbuild/SPECS/
+          rpmbuild -bb --nocheck $HOME/rpmbuild/SPECS/lbctl.spec
+          cp $HOME/rpmbuild/RPMS/noarch/*.rpm dist/
 
       - name: Create GitHub release
         run: |
